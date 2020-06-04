@@ -1,0 +1,212 @@
+---
+
+  - hosts: backup
+    vars:
+      check: /var/containers
+    gather_facts: yes
+    become: yes
+
+    tasks:
+
+    - name: Create a directory if it does not exist
+      file:
+        path: /srv/containers/sync_backup/storage/{{ ansible_hostname }}
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+
+    - name: Check a directory if it does not exist
+      stat:
+        path: "{{ check }}"
+      register: check
+
+    - name: Check a directory  if it does not exist, delegate to 127.0.0.1
+      stat:
+        path: /srv/containers/sync_backup/storage/{{ ansible_hostname }}/containers
+      register: containers_local
+      delegate_to: localhost
+
+    - name: Rsync etc with copy symlinks
+      synchronize:
+        dest_port: "{{ ansible_port }}"
+        mode: pull
+        src: "{{ item.source }}"
+        dest: "{{ item.dest }}"
+        archive: yes
+        links: yes
+        private_key: /root/.ssh/host_rsa
+        rsync_opts:
+          - "--copy-links"
+          - "--ignore-missing-args"
+          - "--quiet"
+          - "--no-motd"
+          - "--exclude-from=exclude-list.txt"
+      with_items:
+        - { source: '/etc', dest: '/srv/containers/sync_backup/storage/{{ ansible_hostname }}' }
+      delegate_to: localhost
+
+    - name: Rsync containers with copy symlinks
+      synchronize:
+        dest_port: "{{ ansible_port }}"
+        mode: pull
+        src: "{{ item.source }}"
+        dest: "{{ item.dest }}"
+        archive: yes
+        links: yes
+        private_key: /root/.ssh/host_rsa
+        rsync_opts:
+          - "--copy-links"
+          - "--ignore-missing-args"
+          - "--quiet"
+          - "--no-motd"
+          - "--exclude-from=exclude-list.txt"
+      with_items:
+        - { source: '/var/containers',
+            dest: '/srv/containers/sync_backup/storage/{{ ansible_hostname }}' }
+      delegate_to: localhost
+      when: check.stat.exists and check.stat.isdir
+
+    - set_fact:
+        localhost_hostname: "{{ ansible_hostname }}"
+
+    - name: Copy fact to localhost server
+      set_fact:
+        localhost_hostname: "{{ localhost_hostname }}"
+      delegate_to: localhost
+      delegate_facts: True
+
+    - name: Find all containers directories
+      find:
+        paths: /srv/containers/sync_backup/storage/{{ localhost_hostname }}
+        recurse: no
+        file_type: directory
+        patterns: 'containers'
+      register: containers_dirs
+      delegate_to: localhost
+
+    - name: Find all etc directories
+      find:
+        paths: /srv/containers/sync_backup/storage/{{ localhost_hostname }}
+        recurse: no
+        file_type: directory
+        patterns: 'etc'
+      register: etc_dirs
+      delegate_to: localhost
+
+    - set_fact:
+        containers: "{{ containers_dirs.files | map(attribute='path') | list }}"
+        etc: "{{ etc_dirs.files | map(attribute='path') | list }}"
+
+    - name: Create a bz2 archive of multiple files, rooted at /etc
+      archive:
+        path: "{{ item }}"
+        remove: yes
+        dest: /srv/containers/sync_backup/storage/{{ localhost_hostname }}/etc.tar.bz2
+        format: bz2
+      loop:
+        - "{{ etc }}"
+      delegate_to: localhost
+
+    - name: Create a bz2 archive of multiple files, rooted at /containers
+      archive:
+        path: "{{ item }}"
+        remove: yes
+        dest: /srv/containers/sync_backup/storage/{{ localhost_hostname }}/containers.tar.bz2
+        format: bz2
+      loop:
+        - "{{ containers }}"
+      delegate_to: localhost
+      when: check.stat.exists and check.stat.isdir
+
+    - name: Ansible remove file wildcard
+      file:
+        path:
+          - "{{ item }}"
+        state: absent
+        force: yes
+      with_items:
+      - "{{ etc_dirs.files | map(attribute='path') | list }}/"
+      - "{{ containers_dirs.files | map(attribute='path') | list }}/"
+      delegate_to: localhost
+
+    - name: Remove directory
+      shell: rm -rf {{ item }}
+      loop:
+        - /srv/containers/sync_backup/storage/*/etc
+        - /srv/containers/sync_backup/storage/*/containers
+      become: yes
+      delegate_to: localhost
+
+
+    - name: Find all archives bz2
+      find:
+        paths: /srv/containers/sync_backup/storage/{{ localhost_hostname }}
+        patterns: '*.tar.bz2'
+        recurse: no
+      register: archives_matched
+      delegate_to: localhost
+
+    - set_fact:
+        encrypt_archives: "{{ archives_matched.files | map(attribute='path') | list }}"
+
+    - name: Vault encrypt archives
+      command: ansible-vault encrypt {{ item }} --vault-password-file=.env
+      args:
+        chdir: /srv/containers/sync_backup
+      with_items:
+        - "{{ encrypt_archives }}"
+      delegate_to: localhost
+
+    - name: Create a bz2 archive of multiple files, rooted at /
+      archive:
+        path: /srv/containers/sync_backup/storage/{{ localhost_hostname }}
+        remove: yes
+        dest: /srv/containers/sync_backup/storage/{{ localhost_hostname }}.tar.bz2
+        format: bz2
+      delegate_to: localhost
+
+  - hosts: localhost
+    gather_facts: yes
+    become: yes
+
+    tasks:
+
+    - name: Find archives bz2, only host
+      find:
+        paths: /srv/containers/sync_backup/storage
+        recurse: no
+        patterns: '*.tar.bz2'
+      register: send_to_git
+
+    - set_fact:
+        send: "{{ send_to_git.files | map(attribute='path') | list }}"
+
+
+    - name: Vault encrypt archives
+      command: ansible-vault encrypt {{ item }} --vault-password-file=.env
+      with_items:
+        - "{{ send }}"
+      args:
+        chdir: /srv/containers/sync_backup
+
+    - name: Find all containers directories
+      find:
+        paths: /srv/containers/sync_backup/storage
+        recurse: no
+        file_type: directory
+      register: remove_all
+
+    - set_fact:
+        remove: "{{ remove_all.files | map(attribute='path') | list }}"
+
+    - name: Ansible remove file wildcard
+      file:
+        path: "{{ item }}"
+        state: absent
+        force: yes
+      with_items: "{{ remove }}"
+
+    - name: sync backups to bitbucket
+      shell: git lfs track storage/* && git checkout master && git add . --all && git commit -m "backups" && git push -u origin master
+      args:
+        chdir: /srv/containers/sync_backup
